@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "devin-bridge": {
+      "command": "python3",
+      "args": ["/home/ubuntu/devin-bridge/devin_bridge_mcp.py"],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
