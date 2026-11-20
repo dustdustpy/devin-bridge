@@ -7,7 +7,10 @@ If the `devin-bridge` MCP server is available, use it to coordinate other local 
 - Do not prompt a session that may have held/active work unless the user explicitly asks. Prefer `devin_queue_prompt`, then let the user or coordinator process it.
 - Before steering an existing session, check `devin_session_status` or `devin_list_sessions`.
 - To change direction safely, use `devin_redirect_session`; it cancels the active turn before sending the new instruction.
-- For long-running work, use `devin_send_message` with `wait=false`, keep `request_id`, then use `devin_wait_request` or `devin_stop_session`.
+- For long-running work, use `devin_send_message` with `wait=false`, keep `request_id`, then use `devin_wait_request` or `devin_stop_session`. A `status: running` result (the turn outlasted `timeout_seconds`) works the same way: keep its `request_id` and call `devin_wait_request`.
+- A session open in Devin Desktop or a CLI window is locked to that process. Sending to it fails with `SessionLockedError`. Do not retry in a loop: queue the prompt, or ask the user to close the session there.
+- After a finished prompt the bridge force-closes the session (`release`, default on) so the user can open it in Desktop. That also ends background shells the turn left running; pass `release: false` when the session must keep them.
+- Permission prompts from the target session are answered by `permission` (`reject` by default, or `allow_once`, `allow_always`, `cancel`). Check `agent_requests` in the result to see what was refused.
 - `cwd` is the filesystem working directory. Sidebar folders/groups are UI-side grouping; `sidebar_folder` is only best-effort metadata and is not guaranteed to move a session in the UI.
 
 ## Common calls

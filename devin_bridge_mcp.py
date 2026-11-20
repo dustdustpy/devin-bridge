@@ -11,6 +11,7 @@ paths separate:
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import glob
 import json
@@ -27,7 +28,8 @@ import threading
 import time
 import traceback
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 if os.name == "posix":
     import fcntl  # type: ignore
@@ -59,7 +61,7 @@ QUEUE_PATH = DATA_DIR / "devin_bridge_queue.json"
 QUEUE_LOCK_PATH = DATA_DIR / "devin_bridge_queue.lock"
 SCRIPT_PATH = Path(__file__).resolve()
 SERVER_NAME = "devin-bridge"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
 LOCK_PATTERNS = (
@@ -71,6 +73,24 @@ LOCK_PATTERNS = (
 
 MAX_TOOL_OUTPUT_CHARS = int(os.environ.get("DEVIN_BRIDGE_MAX_OUTPUT", "60000"))
 DEFAULT_PROMPT_TIMEOUT = float(os.environ.get("DEVIN_BRIDGE_PROMPT_TIMEOUT", "180"))
+
+# `--process-model` passed to the spawned `devin acp` (daemon | in-process). Empty = Devin's default.
+PROCESS_MODEL = os.environ.get("DEVIN_BRIDGE_PROCESS_MODEL", "").strip()
+# How the bridge answers the agent's session/request_permission when the caller set no policy.
+PERMISSION_POLICIES = ("reject", "allow_once", "allow_always", "cancel")
+DEFAULT_PERMISSION_POLICY = os.environ.get("DEVIN_BRIDGE_PERMISSION", "reject").strip().lower()
+if DEFAULT_PERMISSION_POLICY not in PERMISSION_POLICIES:
+    DEFAULT_PERMISSION_POLICY = "reject"
+# Close (unlock) a session once a prompt finishes, so Devin Desktop/CLI can open it again.
+RELEASE_AFTER_PROMPT = os.environ.get("DEVIN_BRIDGE_RELEASE", "1").strip().lower() not in ("0", "false", "no", "off")
+# The bridge cannot serve fs/* or terminal/* for the agent. Advertising them makes Devin route
+# file reads and shell commands to the client, and every such turn then hangs waiting on us.
+CLIENT_CAPABILITIES: Dict[str, Any] = {
+    "fs": {"readTextFile": False, "writeTextFile": False},
+    "terminal": False,
+    "session": {"configOptions": {"boolean": {}}},
+}
+SESSION_UPDATE_BUFFER = int(os.environ.get("DEVIN_BRIDGE_UPDATE_BUFFER", "5000"))
 
 
 class BridgeError(RuntimeError):
@@ -125,13 +145,15 @@ def _first_existing_dir(*paths: Optional[str]) -> str:
     return str(HOME)
 
 
-def _sqlite_ro() -> sqlite3.Connection:
+def _sqlite_ro() -> "contextlib.closing[sqlite3.Connection]":
+    """Read-only DB handle for `with _sqlite_ro() as con:`; the connection is closed on exit
+    (a bare sqlite3 connection used as a context manager only commits, it never closes)."""
     if not DB_PATH.exists():
         raise BridgeError(f"Devin session DB not found: {DB_PATH}")
     uri = f"file:{DB_PATH}?mode=ro"
     con = sqlite3.connect(uri, uri=True, timeout=10)
     con.row_factory = sqlite3.Row
-    return con
+    return contextlib.closing(con)
 
 
 def _table_cols(con: sqlite3.Connection, table: str) -> List[str]:
@@ -269,6 +291,27 @@ def _parse_message(raw: Any) -> Dict[str, Any]:
     return {"role": "unknown", "content": _normalize_content(value)}
 
 
+def _chain_head(con: sqlite3.Connection, session_id: str, main_chain_id: int) -> int:
+    """`main_chain_id` lags behind a running turn; use the newest node when it descends from it."""
+    row = con.execute(
+        "SELECT MAX(node_id) FROM message_nodes WHERE session_id=?", (session_id,)
+    ).fetchone()
+    newest = row[0] if row else None
+    if not newest or newest == main_chain_id:
+        return main_chain_id
+    cur, hops = newest, 0
+    while cur is not None and hops < 500:
+        if cur == main_chain_id:
+            return newest
+        parent = con.execute(
+            "SELECT parent_node_id FROM message_nodes WHERE session_id=? AND node_id=?",
+            (session_id, cur),
+        ).fetchone()
+        cur = parent[0] if parent else None
+        hops += 1
+    return main_chain_id
+
+
 def _message_chain(session_id: str) -> List[Dict[str, Any]]:
     session_id = resolve_session_id(session_id)
     with _sqlite_ro() as con:
@@ -290,7 +333,7 @@ def _message_chain(session_id: str) -> List[Dict[str, Any]]:
         fields = [c for c in wanted if c in cols]
         chain: List[Dict[str, Any]] = []
         seen = set()
-        cur = srow[0]
+        cur = _chain_head(con, session_id, srow[0])
         while cur is not None:
             if cur in seen:
                 raise BridgeError(f"cycle in message chain at node {cur}")
@@ -331,6 +374,7 @@ def dump_session_log(
         f"- backend_type: {meta.get('backend_type')}",
         f"- last_activity_at: {meta.get('last_activity_at')}",
         f"- dumped_at: {_utc_ts()}",
+        f"- note: main chain since the last context compaction; earlier turns are summarized in {DATA_DIR / 'summaries'}",
         "",
     ]
     included = 0
@@ -562,25 +606,48 @@ def _find_devin_command() -> str:
     override = os.environ.get("DEVIN_ACP_COMMAND") or os.environ.get("DEVIN_CLI")
     if override:
         return override
+    localapp = os.environ.get("LOCALAPPDATA") or str(HOME / "AppData" / "Local")
+    if IS_WINDOWS:
+        # Prefer the binary bundled with Devin Desktop: it hosts the user's sessions, while the
+        # standalone CLI on PATH can lag versions behind yet shares the same sessions.db.
+        for cand in (
+            Path(localapp) / "Programs/Devin/resources/app/extensions/windsurf/devin/bin/devin.exe",
+            Path(localapp) / "Programs/Windsurf/resources/app/extensions/windsurf/devin/bin/devin.exe",
+        ):
+            if cand.is_file():
+                return str(cand)
     found = shutil.which("devin") or shutil.which("devin.exe")
     if found:
         return found
     if IS_WINDOWS:
-        localapp = os.environ.get("LOCALAPPDATA") or str(HOME / "AppData" / "Local")
-        candidates = [
-            Path(localapp) / "Programs/Devin/resources/app/extensions/windsurf/devin/bin/devin.exe",
-            Path(localapp) / "Programs/Windsurf/resources/app/extensions/windsurf/devin/bin/devin.exe",
-        ]
-        for cand in candidates:
-            if cand.is_file():
-                return str(cand)
+        standalone = Path(localapp) / "devin/cli/bin/devin.exe"
+        if standalone.is_file():
+            return str(standalone)
     raise BridgeError(
         "devin CLI binary not found; set DEVIN_ACP_COMMAND to the devin executable path"
     )
 
 
+_VERSION_CACHE: Dict[str, str] = {}
+
+
+def _devin_version(cmd: str) -> str:
+    if cmd not in _VERSION_CACHE:
+        try:
+            kwargs: Dict[str, Any] = {}
+            if IS_WINDOWS:
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            out = subprocess.run([cmd, "version"], capture_output=True, timeout=20, **kwargs)
+            lines = (out.stdout or out.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+            _VERSION_CACHE[cmd] = lines[0] if lines else f"exit code {out.returncode}"
+        except Exception as e:
+            _VERSION_CACHE[cmd] = f"unknown ({e})"
+    return _VERSION_CACHE[cmd]
+
+
 _TOKEN_CACHE: Optional[str] = None
 _TOKEN_RESOLVED = False
+_TOKEN_ERROR: Optional[str] = None
 
 
 def _desktop_secret_db() -> Optional[Path]:
@@ -604,7 +671,7 @@ def _load_api_token() -> Optional[str]:
     with the DPAPI-protected os_crypt key from "Local State". This only works
     for the same Windows user that owns the Desktop profile.
     """
-    global _TOKEN_CACHE, _TOKEN_RESOLVED
+    global _TOKEN_CACHE, _TOKEN_RESOLVED, _TOKEN_ERROR
     if _TOKEN_RESOLVED:
         return _TOKEN_CACHE
     _TOKEN_RESOLVED = True
@@ -614,6 +681,7 @@ def _load_api_token() -> Optional[str]:
             _TOKEN_CACHE = value.strip()
             return _TOKEN_CACHE
     if not IS_WINDOWS:
+        _TOKEN_ERROR = "no DEVIN_BRIDGE_API_KEY/WINDSURF_API_KEY set (Desktop secret store is Windows-only)"
         return None
     try:
         import base64
@@ -623,6 +691,7 @@ def _load_api_token() -> Optional[str]:
 
         db = _desktop_secret_db()
         if not db:
+            _TOKEN_ERROR = "Devin Desktop secret store (User/globalStorage/state.vscdb) not found"
             return None
 
         class DATA_BLOB(ctypes.Structure):
@@ -651,6 +720,7 @@ def _load_api_token() -> Optional[str]:
         enc_key = base64.b64decode(ls["os_crypt"]["encrypted_key"])
         key = unprotect(enc_key[5:])
         if not key:
+            _TOKEN_ERROR = "DPAPI could not unprotect Devin Desktop's os_crypt key (different Windows user?)"
             return None
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
         try:
@@ -680,8 +750,13 @@ def _load_api_token() -> Optional[str]:
                     if token:
                         _TOKEN_CACHE = token
                         return _TOKEN_CACHE
-    except Exception:
+    except ImportError as e:
+        _TOKEN_ERROR = f"missing Python package for the Desktop token: {e.name} (pip install cryptography)"
         return None
+    except Exception as e:
+        _TOKEN_ERROR = f"{type(e).__name__}: {e}"
+        return None
+    _TOKEN_ERROR = "no Devin session accessToken found in the Desktop secret store (sign in to Devin Desktop)"
     return None
 
 
@@ -690,6 +765,86 @@ def _token_source() -> str:
         if os.environ.get(var):
             return f"env:{var}"
     return "desktop-secret" if _load_api_token() else "none"
+
+
+def _kill_on_close_job(proc: subprocess.Popen) -> Any:
+    """Windows: tie the `devin acp` child to a job object that dies with the bridge.
+
+    Without it, a bridge that gets killed leaves `devin acp` running, and the orphan keeps
+    holding the lock of every session it loaded, so nothing else can open them.
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _Basic(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _Io(ctypes.Structure):
+            _fields_ = [
+                (name, ctypes.c_uint64)
+                for name in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+                )
+            ]
+
+        class _Extended(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _Basic),
+                ("IoInfo", _Io),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _Extended()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))  # 9 = ExtendedLimitInformation
+        ok = ok and kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(int(proc._handle)))  # type: ignore[attr-defined]
+        if not ok:
+            kernel32.CloseHandle(job)
+            return None
+        return job
+    except Exception:
+        return None
+
+
+def _close_job(job: Any) -> None:
+    if not (job and IS_WINDOWS):
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle(job)
+    except Exception:
+        pass
 
 
 class AcpClient:
@@ -711,13 +866,18 @@ class AcpClient:
         self._rx: "_queue.Queue[Any]" = _queue.Queue()
         self._eof = object()
         self.stderr_tail: List[str] = []
+        self.job: Any = None  # Windows job object: `devin acp` dies with the bridge
+        self.seq = 0
+        self.session_updates: Dict[str, Deque[Dict[str, Any]]] = {}
+        self.permission_policy: Dict[str, str] = {}
+        self.agent_requests: Deque[Dict[str, Any]] = deque(maxlen=200)
 
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
         try:
             if self.file:
-                self.file.close()
+                self.file.close()  # EOF on stdin lets `devin acp` save state and exit cleanly
         except Exception:
             pass
         try:
@@ -727,13 +887,23 @@ class AcpClient:
             pass
         if self.proc:
             try:
-                self.proc.kill()
+                self.proc.wait(timeout=3)
             except Exception:
-                pass
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
             self.proc = None
+        _close_job(self.job)
+        self.job = None
         self.sock = None
         self.file = None
         self.initialized = False
+        # Loads and requests made through the old process died with it. Keeping them would make
+        # _resume skip the reload and send prompts to a session the new process never opened.
+        self.resumed.clear()
+        self.pending.clear()
+        self.completed.clear()
         while True:
             try:
                 self._rx.get_nowait()
@@ -785,8 +955,11 @@ class AcpClient:
         kwargs: Dict[str, Any] = {}
         if IS_WINDOWS:
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        args = [cmd, "acp"]
+        if PROCESS_MODEL:
+            args += ["--process-model", PROCESS_MODEL]
         self.proc = subprocess.Popen(
-            [cmd, "acp"],
+            args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -794,6 +967,7 @@ class AcpClient:
             cwd=cwd,
             **kwargs,
         )
+        self.job = _kill_on_close_job(self.proc)
         self.file = self.proc.stdin
         self.transport = "stdio"
         self.devin_cmd = cmd
@@ -852,11 +1026,7 @@ class AcpClient:
                 "method": "initialize",
                 "params": {
                     "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": {"readTextFile": True, "writeTextFile": True},
-                        "terminal": True,
-                        "session": {"configOptions": {"boolean": {}}},
-                    },
+                    "clientCapabilities": CLIENT_CAPABILITIES,
                     "clientInfo": {"name": "devin-bridge-mcp", "version": SERVER_VERSION},
                 },
             }
@@ -896,19 +1066,91 @@ class AcpClient:
             return None
         if msg is self._eof:
             self.initialized = False
-            detail = f"; last stderr: {self.stderr_tail[-1]}" if self.stderr_tail else ""
+            errors = [line for line in self.stderr_tail if "error" in line.lower()][-3:]
+            tail = errors or self.stderr_tail[-1:]
+            detail = f"; stderr: {' | '.join(tail)}" if tail else ""
             raise EOFError(f"ACP stream closed{detail}")
         return msg
 
     def _handle_side_message(self, msg: Dict[str, Any]) -> None:
-        if "id" in msg and ("result" in msg or "error" in msg):
-            self.completed[msg["id"]] = msg
+        method = msg.get("method")
+        if not method:
+            if "id" in msg and ("result" in msg or "error" in msg):
+                self.completed[msg["id"]] = msg
             return
-        if msg.get("method"):
-            item = {"received_at": _utc_ts(), "message": msg}
-            self.updates.append(item)
-            if len(self.updates) > 1000:
-                self.updates = self.updates[-1000:]
+        if "id" in msg:
+            # A request from the agent to the client. It must always get an answer, or the
+            # agent's turn blocks forever waiting on us.
+            self._answer_agent_request(msg)
+            return
+        self._record_update(msg)
+
+    def _record_update(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        self.seq += 1
+        item = {"seq": self.seq, "received_at": _utc_ts(), "message": msg}
+        self.updates.append(item)
+        if len(self.updates) > 1000:
+            self.updates = self.updates[-1000:]
+        sid = (msg.get("params") or {}).get("sessionId")
+        if sid:
+            buf = self.session_updates.get(sid)
+            if buf is None:
+                buf = self.session_updates[sid] = deque(maxlen=SESSION_UPDATE_BUFFER)
+            buf.append(item)
+        return item
+
+    def updates_since(self, session_id: str, seq: int) -> List[Dict[str, Any]]:
+        return [item for item in self.session_updates.get(session_id, ()) if item["seq"] > seq]
+
+    def pending_prompts(self, session_id: str) -> List[int]:
+        return [
+            rid
+            for rid, meta in self.pending.items()
+            if meta.get("method") == "session/prompt"
+            and (meta.get("params") or {}).get("sessionId") == session_id
+        ]
+
+    def _answer_agent_request(self, msg: Dict[str, Any]) -> None:
+        method = str(msg.get("method"))
+        params = msg.get("params") or {}
+        sid = params.get("sessionId")
+        record: Dict[str, Any] = {"at": _utc_ts(), "method": method, "session_id": sid}
+        if method == "session/request_permission":
+            policy = self.permission_policy.get(sid or "", DEFAULT_PERMISSION_POLICY)
+            options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
+            prefer = {
+                "allow_once": ("allow_once", "allow_always"),
+                "allow_always": ("allow_always", "allow_once"),
+                "reject": ("reject_once", "reject_always"),
+            }.get(policy, ())
+            pick = next((o for kind in prefer for o in options if o.get("kind") == kind), None)
+            outcome = (
+                {"outcome": "selected", "optionId": pick.get("optionId")}
+                if pick
+                else {"outcome": "cancelled"}
+            )
+            response: Dict[str, Any] = {"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": outcome}}
+            record.update(
+                {
+                    "tool": (params.get("toolCall") or {}).get("title"),
+                    "policy": policy,
+                    "answer": pick.get("kind") if pick else "cancelled",
+                }
+            )
+        else:
+            response = {
+                "jsonrpc": "2.0",
+                "id": msg["id"],
+                "error": {"code": -32601, "message": f"devin-bridge does not serve client method {method}"},
+            }
+            record["answer"] = "unsupported"
+        try:
+            with self.lock:
+                self._write_raw(response)
+        except BridgeError:
+            record["answer"] = f"{record.get('answer')} (reply failed)"
+        self.agent_requests.append(record)
+        self._record_update({"method": "_bridge/agent_request", "params": dict(record, sessionId=sid)})
 
     def send_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> int:
         self._connect()
@@ -925,8 +1167,13 @@ class AcpClient:
             self._write_raw({"jsonrpc": "2.0", "method": method, "params": params or {}})
 
     def wait(self, req_id: int, timeout: float = 30, updates_for_session: Optional[str] = None) -> Dict[str, Any]:
+        """Block until request `req_id` completes.
+
+        Session updates that arrive meanwhile land in per-session buffers, so a caller that
+        sent a prompt earlier (wait=false) still gets the full text via updates_since().
+        `updates_for_session` is accepted for backward compatibility and ignored.
+        """
         deadline = time.monotonic() + timeout
-        collected: List[Dict[str, Any]] = []
         while True:
             if req_id in self.completed:
                 msg = self.completed.pop(req_id)
@@ -935,22 +1182,13 @@ class AcpClient:
                     err = msg.get("error") or {}
                     raise AcpError(err.get("message") or "ACP request failed", err.get("code"), err.get("data"))
                 result = msg.get("result")
-                if updates_for_session and collected:
-                    if isinstance(result, dict):
-                        result = dict(result)
-                        result["_bridge_updates"] = collected
                 return result if isinstance(result, dict) else {"result": result}
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"timed out waiting for ACP request id {req_id} ({timeout}s)")
             msg = self._read_raw(timeout=min(remaining, 30), raise_on_timeout=False)
-            if not msg:
-                continue
-            if msg.get("method") and updates_for_session:
-                params = msg.get("params") or {}
-                if params.get("sessionId") == updates_for_session:
-                    collected.append(msg)
-            self._handle_side_message(msg)
+            if msg:
+                self._handle_side_message(msg)
 
     def call(
         self,
@@ -983,8 +1221,20 @@ def _session_from_acp(session_id: str) -> Optional[Dict[str, Any]]:
 _RESUME_METHODS = ["session/load", "session/resume"] if IS_WINDOWS else ["session/resume", "session/load"]
 
 
+class SessionLockedError(BridgeError):
+    pass
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    if not isinstance(exc, AcpError):
+        return False
+    data = exc.data if isinstance(exc.data, dict) else {}
+    return exc.code == -32015 or data.get("cognition.ai/errorKind") == "session_locked"
+
+
 def _resume(session_id: str, cwd: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
     sid = _acp_session_id(session_id)
+    ACP._connect()  # if `devin acp` had died, reconnecting clears the stale load cache first
     if not force and sid in ACP.resumed:
         return ACP.resumed[sid]
     meta = _session_row(sid) or {}
@@ -995,14 +1245,26 @@ def _resume(session_id: str, cwd: Optional[str] = None, force: bool = False) -> 
             result = ACP.call(
                 method,
                 {"sessionId": sid, "cwd": selected_cwd, "mcpServers": [_bridge_mcp_server()]},
-                timeout=60,
+                timeout=90,
             )
             if idx != 0:
                 _RESUME_METHODS.insert(0, _RESUME_METHODS.pop(_RESUME_METHODS.index(method)))
             ACP.resumed[sid] = result
             return result
+        except AcpError as e:
+            if _is_lock_error(e):
+                raise SessionLockedError(
+                    f"Session '{sid}' is open in another Devin process (Devin Desktop, a CLI window or "
+                    "another bridge). Local sessions run in-process, so only one process can hold a "
+                    "session at a time. Close it there and retry, or queue the prompt with "
+                    "devin_queue_prompt and run devin_process_queue once it is free."
+                ) from e
+            last_err = e
+            if e.code not in (-32601, -32602):  # fall back only when this load method is unsupported
+                break
         except Exception as e:
             last_err = e
+            break
     raise last_err or BridgeError("session resume failed")
 
 
@@ -1152,34 +1414,152 @@ def _extract_agent_chunks(messages: Iterable[Dict[str, Any]], session_id: str) -
     return "".join(chunks)
 
 
+def _normalize_policy(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    policy = str(value).strip().lower().replace("-", "_")
+    policy = {"allow": "allow_once", "approve": "allow_once", "deny": "reject"}.get(policy, policy)
+    if policy not in PERMISSION_POLICIES:
+        raise BridgeError(f"permission must be one of: {', '.join(PERMISSION_POLICIES)}")
+    return policy
+
+
+def _turn_summary(session_id: str, since_seq: int) -> Dict[str, Any]:
+    items = ACP.updates_since(session_id, since_seq)
+    calls: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    asks: List[Dict[str, Any]] = []
+    segments: List[str] = []  # agent text, split where tool calls interrupt it
+    current: List[str] = []
+    for item in items:
+        msg = item.get("message") or {}
+        params = msg.get("params") or {}
+        if msg.get("method") == "_bridge/agent_request":
+            asks.append({k: params.get(k) for k in ("method", "tool", "policy", "answer")})
+            continue
+        update = params.get("update") or {}
+        kind = update.get("sessionUpdate")
+        if kind == "agent_message_chunk":
+            current.append(_extract_agent_chunks([item], session_id))
+        elif kind in ("tool_call", "tool_call_update"):
+            if current:
+                segments.append("".join(current))
+                current = []
+            tid = str(update.get("toolCallId") or f"#{len(order)}")
+            if tid not in calls:
+                calls[tid] = {}
+                order.append(tid)
+            for key in ("title", "kind", "status"):
+                if update.get(key):
+                    calls[tid][key] = update[key]
+    if current:
+        segments.append("".join(current))
+    return {
+        "response_text": "\n\n".join(s.strip() for s in segments if s.strip()),
+        "tool_calls": [calls[t] for t in order],
+        "agent_requests": asks,
+        "updates_seen": len(items),
+    }
+
+
+FORCE_CLOSE_META = {"cognition.ai/force": True}
+
+
+def _release(session_id: str) -> Any:
+    """Unload a session this bridge loaded, so Devin Desktop/CLI or another bridge can open it.
+
+    A plain session/close leaves the session loaded and locked in this process; only the forced
+    close (cognition.ai/force) unloads it. That also ends background shells the turn left behind,
+    so pass release=false to keep such work alive.
+    """
+    if session_id not in ACP.resumed:
+        return False
+    try:
+        ACP.call("session/close", {"sessionId": session_id, "_meta": FORCE_CLOSE_META}, timeout=30)
+    except Exception as e:  # unsupported or refused: keep it loaded
+        return f"kept open: {e}"
+    ACP.resumed.pop(session_id, None)
+    return True
+
+
+def _finish_prompt(req_id: int, timeout: float, base: Dict[str, Any]) -> Dict[str, Any]:
+    meta = dict(ACP.pending.get(req_id) or {})
+    sid = (meta.get("params") or {}).get("sessionId") or base.get("session_id")
+    start = int(meta.get("update_start") or 0)
+    base.setdefault("session_id", sid)
+    try:
+        result = ACP.wait(req_id, timeout=timeout)
+    except TimeoutError:
+        summary = _turn_summary(sid, start) if sid else {}
+        base.update(
+            {
+                "status": "running",
+                "partial_text": (summary.get("response_text") or "")[-4000:],
+                "tool_calls": (summary.get("tool_calls") or [])[-15:],
+                "hint": "Devin is still working. Call devin_wait_request with this request_id to keep "
+                        "waiting, or devin_stop_session to cancel it.",
+            }
+        )
+        return base
+    summary = _turn_summary(sid, start) if sid else {}
+    base.update(
+        {
+            "status": "done",
+            "stop_reason": result.get("stopReason"),
+            "response_text": summary.get("response_text", ""),
+            "tool_calls": (summary.get("tool_calls") or [])[-30:],
+            "agent_requests": summary.get("agent_requests", []),
+            "usage": result.get("usage"),
+            "updates_seen": summary.get("updates_seen", 0),
+        }
+    )
+    release = meta.get("release")
+    if release is None:
+        release = RELEASE_AFTER_PROMPT
+    if release and sid and not ACP.pending_prompts(sid):
+        base["released"] = _release(sid)
+    return base
+
+
 def _send_prompt(
     session_id: str,
     text: str,
     wait: bool = True,
     timeout: float = DEFAULT_PROMPT_TIMEOUT,
     cwd: Optional[str] = None,
+    permission: Any = None,
+    release: Optional[bool] = None,
 ) -> Dict[str, Any]:
     if not text:
         raise BridgeError("message/prompt text is required")
     sid = _acp_session_id(session_id)
-    resume_result = _resume(sid, cwd=cwd)
+    busy = ACP.pending_prompts(sid) if ACP.initialized else []
+    if busy:
+        raise BridgeError(
+            f"session {sid} already has a prompt running from this bridge (request_id {busy[0]}). "
+            "Use devin_wait_request, devin_stop_session or devin_redirect_session first."
+        )
+    policy = _normalize_policy(permission)
+    _resume(sid, cwd=cwd)
+    if policy:
+        ACP.permission_policy[sid] = policy
+    start = ACP.seq
     req_id = ACP.send_request(
         "session/prompt",
         {"sessionId": sid, "prompt": [{"type": "text", "text": text}]},
     )
-    base: Dict[str, Any] = {"session_id": sid, "request_id": req_id, "sent": True, "wait": bool(wait)}
+    ACP.pending[req_id].update({"update_start": start, "release": release})
+    base: Dict[str, Any] = {
+        "session_id": sid,
+        "request_id": req_id,
+        "sent": True,
+        "wait": bool(wait),
+        "permission_policy": ACP.permission_policy.get(sid, DEFAULT_PERMISSION_POLICY),
+    }
     if not wait:
+        base["status"] = "running"
         return base
-    result = ACP.wait(req_id, timeout=timeout, updates_for_session=sid)
-    updates = result.pop("_bridge_updates", []) if isinstance(result, dict) else []
-    base.update(
-        {
-            "result": result,
-            "response_text": _extract_agent_chunks(updates, sid),
-            "updates_seen": len(updates),
-        }
-    )
-    return base
+    return _finish_prompt(req_id, timeout, base)
 
 
 def _wait_seconds(value: Any, default: float = 30.0) -> float:
@@ -1203,7 +1583,13 @@ def tool_bridge_status(args: Dict[str, Any]) -> Dict[str, Any]:
         "db_exists": DB_PATH.exists(),
         "token_source": _token_source(),
         "transport": ACP.transport,
+        "process_model": PROCESS_MODEL or "devin default",
+        "default_permission_policy": DEFAULT_PERMISSION_POLICY,
+        "release_after_prompt": RELEASE_AFTER_PROMPT,
+        "client_capabilities": CLIENT_CAPABILITIES,
     }
+    if _TOKEN_ERROR and out["token_source"] == "none":
+        out["token_error"] = _TOKEN_ERROR
     if ACP.lock_path:
         out["acp_lock"] = str(ACP.lock_path)
         out["acp_host_pid"] = ACP.lock_data.get("pid")
@@ -1211,18 +1597,41 @@ def tool_bridge_status(args: Dict[str, Any]) -> Dict[str, Any]:
     if ACP.devin_cmd:
         out["devin_command"] = ACP.devin_cmd
     try:
-        out["devin_command_resolved"] = _find_devin_command()
+        resolved = _find_devin_command()
+        out["devin_command_resolved"] = resolved
+        out["devin_version"] = _devin_version(resolved)
     except Exception as e:
         out["devin_command_error"] = str(e)
     try:
         ACP._connect()
         out["acp_initialized"] = ACP.initialized
         out["acp_transport"] = ACP.transport
+        out["acp_pid"] = ACP.proc.pid if ACP.proc else None
+        out["kill_on_exit_job"] = bool(ACP.job)
+        out["loaded_sessions"] = sorted(ACP.resumed)
+        out["prompts_in_flight"] = {
+            str(rid): (meta.get("params") or {}).get("sessionId")
+            for rid, meta in ACP.pending.items()
+            if meta.get("method") == "session/prompt"
+        }
+        if ACP.agent_requests:
+            out["recent_agent_requests"] = list(ACP.agent_requests)[-10:]
     except Exception as e:
         out["ok"] = False
         out["acp_error"] = str(e)
         if ACP.stderr_tail:
             out["acp_stderr_tail"] = ACP.stderr_tail[-10:]
+    return out
+
+
+def _annotate_session(sess: Any) -> Any:
+    """Tell sessions held by this bridge apart from sessions open in another Devin process."""
+    if not isinstance(sess, dict):
+        return sess
+    held_here = sess.get("sessionId") in ACP.resumed
+    out = dict(sess)
+    out["held_by_this_bridge"] = held_here
+    out["open_elsewhere"] = bool((sess.get("_meta") or {}).get("cognition.ai/isLocked")) and not held_here
     return out
 
 
@@ -1241,7 +1650,8 @@ def tool_list_sessions(args: Dict[str, Any]) -> Dict[str, Any]:
                         s for s in sessions
                         if q in json.dumps(s, ensure_ascii=False).lower()
                     ]
-                return {"source": "acp", "sessions": sessions[:limit], "count": min(len(sessions), limit)}
+                sessions = [_annotate_session(s) for s in sessions[:limit]]
+                return {"source": "acp", "sessions": sessions, "count": len(sessions)}
         except Exception as e:
             if source == "acp":
                 raise
@@ -1259,7 +1669,10 @@ def tool_session_status(args: Dict[str, Any]) -> Dict[str, Any]:
     sid = _acp_session_id(str(args.get("session_id") or ""))
     meta = _session_row(sid) or {"id": sid}
     acp = _session_from_acp(sid)
-    out: Dict[str, Any] = {"session_id": sid, "db": meta, "acp": acp}
+    out: Dict[str, Any] = {"session_id": sid, "db": meta, "acp": _annotate_session(acp) if acp else None}
+    busy = ACP.pending_prompts(sid)
+    if busy:
+        out["prompts_in_flight"] = busy
     if args.get("include_config"):
         resumed = _resume(sid, cwd=args.get("cwd"))
         out["configOptions"] = resumed.get("configOptions", [])
@@ -1288,7 +1701,9 @@ def tool_resume_session(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def tool_new_session(args: Dict[str, Any]) -> Dict[str, Any]:
     cwd = _first_existing_dir(args.get("cwd"), str(HOME))
-    params = {"cwd": cwd, "mcpServers": [_bridge_mcp_server()]}
+    policy = _normalize_policy(args.get("permission"))
+    attach_bridge = args.get("attach_bridge", True)
+    params = {"cwd": cwd, "mcpServers": [_bridge_mcp_server()] if attach_bridge else []}
     meta: Dict[str, Any] = {}
     if args.get("title"):
         meta["cognition.ai/sessionTitle"] = str(args["title"])
@@ -1321,11 +1736,15 @@ def tool_new_session(args: Dict[str, Any]) -> Dict[str, Any]:
     thinking = args.get("thinking") or args.get("thought_level")
     if thinking:
         out["thinking"] = _set_config(sid, "thought_level", thinking, cwd=cwd)
+    if policy:
+        ACP.permission_policy[sid] = policy
     if args.get("prompt"):
         prompt = str(args["prompt"])
         wait = bool(args.get("wait", False))
         timeout = _wait_seconds(args.get("timeout_seconds"), DEFAULT_PROMPT_TIMEOUT)
-        out["prompt"] = _send_prompt(sid, prompt, wait=wait, timeout=timeout, cwd=cwd)
+        out["prompt"] = _send_prompt(
+            sid, prompt, wait=wait, timeout=timeout, cwd=cwd, release=args.get("release")
+        )
     return out
 
 
@@ -1341,6 +1760,8 @@ def tool_send_message(args: Dict[str, Any]) -> Dict[str, Any]:
         wait=bool(args.get("wait", True)),
         timeout=_wait_seconds(args.get("timeout_seconds"), DEFAULT_PROMPT_TIMEOUT),
         cwd=args.get("cwd"),
+        permission=args.get("permission"),
+        release=args.get("release"),
     )
 
 
@@ -1527,20 +1948,26 @@ def tool_slash_command(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def tool_stop_session(args: Dict[str, Any]) -> Dict[str, Any]:
     sid = _acp_session_id(str(args.get("session_id") or ""))
+    in_flight = ACP.pending_prompts(sid) if ACP.initialized else []
+    out: Dict[str, Any] = {"session_id": sid, "cancel_sent": False, "prompts": []}
+    if not in_flight and sid not in ACP.resumed:
+        out["note"] = (
+            "This bridge has not loaded this session, so there is no turn here to cancel. If Devin "
+            "Desktop or a CLI window is running it, stop it there."
+        )
+        return out
     ACP.notify("session/cancel", {"sessionId": sid})
+    out["cancel_sent"] = True
     wait_seconds = _wait_seconds(args.get("wait_seconds"), 10)
-    deadline = time.monotonic() + wait_seconds
-    last_acp = None
-    while time.monotonic() < deadline:
+    for rid in in_flight:
         try:
-            last_acp = _session_from_acp(sid)
-        except Exception:
-            last_acp = None
-        state = json.dumps(last_acp or {}).lower()
-        if not any(x in state for x in ("working", "running", "busy", "processing")):
-            break
-        time.sleep(0.5)
-    return {"session_id": sid, "cancel_sent": True, "session": last_acp}
+            result = ACP.wait(rid, timeout=wait_seconds)
+            out["prompts"].append({"request_id": rid, "stop_reason": result.get("stopReason")})
+        except TimeoutError:
+            out["prompts"].append({"request_id": rid, "status": "still stopping"})
+        except AcpError as e:
+            out["prompts"].append({"request_id": rid, "error": str(e)})
+    return out
 
 
 def tool_redirect_session(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1562,6 +1989,8 @@ def tool_redirect_session(args: Dict[str, Any]) -> Dict[str, Any]:
         wait=bool(args.get("wait", False)),
         timeout=_wait_seconds(args.get("timeout_seconds"), DEFAULT_PROMPT_TIMEOUT),
         cwd=args.get("cwd"),
+        permission=args.get("permission"),
+        release=args.get("release"),
     )
     return out
 
@@ -1571,20 +2000,13 @@ def tool_wait_request(args: Dict[str, Any]) -> Dict[str, Any]:
         req_id = int(args.get("request_id"))
     except Exception:
         raise BridgeError("request_id must be the integer returned by devin_send_message")
+    if req_id not in ACP.pending and req_id not in ACP.completed:
+        raise BridgeError(
+            f"unknown request_id {req_id}: it was already collected, or the bridge restarted since it "
+            "was sent (read the transcript with devin_dump_session)"
+        )
     timeout = _wait_seconds(args.get("timeout_seconds"), DEFAULT_PROMPT_TIMEOUT)
-    pending = ACP.pending.get(req_id, {})
-    sid = None
-    if isinstance(pending.get("params"), dict):
-        sid = pending["params"].get("sessionId")
-    result = ACP.wait(req_id, timeout=timeout, updates_for_session=sid)
-    updates = result.pop("_bridge_updates", []) if isinstance(result, dict) else []
-    return {
-        "request_id": req_id,
-        "session_id": sid,
-        "result": result,
-        "response_text": _extract_agent_chunks(updates, sid) if sid else "",
-        "updates_seen": len(updates),
-    }
+    return _finish_prompt(req_id, timeout, {"request_id": req_id})
 
 
 def tool_get_config_options(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1657,9 +2079,13 @@ def tool_close_session(args: Dict[str, Any]) -> Dict[str, Any]:
     sid = _acp_session_id(str(args.get("session_id") or ""))
     if args.get("stop_first"):
         tool_stop_session({"session_id": sid, "wait_seconds": args.get("wait_seconds", 10)})
-    result = ACP.call("session/close", {"sessionId": sid}, timeout=30)
+    force = args.get("force", True)
+    params: Dict[str, Any] = {"sessionId": sid}
+    if force:
+        params["_meta"] = FORCE_CLOSE_META  # without it the session stays loaded and locked here
+    result = ACP.call("session/close", params, timeout=30)
     ACP.resumed.pop(sid, None)
-    return {"session_id": sid, "closed": True, "result": result}
+    return {"session_id": sid, "closed": True, "lock_released": bool(force), "result": result}
 
 
 def tool_delete_session(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1740,12 +2166,18 @@ def tool_process_queue(args: Dict[str, Any]) -> Dict[str, Any]:
             )
             updated = _queue_update_job(
                 job["id"],
-                status="done",
+                status="done" if result.get("status") == "done" else "running",
                 request_id=result.get("request_id"),
                 result=result,
                 error=None,
             )
             processed.append({"job": updated or job, "ok": True})
+        except SessionLockedError as e:
+            # Not a failure: the session is busy in another process. Put the job back and stop,
+            # otherwise the next claim would pick the same job again.
+            updated = _queue_update_job(job["id"], status="queued", error=str(e))
+            processed.append({"job": updated or job, "ok": False, "error": str(e), "requeued": True})
+            break
         except Exception as e:
             updated = _queue_update_job(job["id"], status="failed", error=str(e))
             processed.append({"job": updated or job, "ok": False, "error": str(e)})
@@ -1765,10 +2197,23 @@ def tool_queue_cancel(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"job": job, "cancelled": job.get("status") == "cancelled"}
 
 
+PERMISSION_SCHEMA: Dict[str, Any] = {
+    "type": "string",
+    "enum": list(PERMISSION_POLICIES),
+    "description": "How the bridge answers Devin's permission prompts in this session "
+                   "(default: DEVIN_BRIDGE_PERMISSION, normally reject). Sessions in bypass mode never ask.",
+}
+RELEASE_SCHEMA: Dict[str, Any] = {
+    "type": "boolean",
+    "description": "Close the session after the prompt finishes so Devin Desktop/CLI can open it "
+                   "(default true; env DEVIN_BRIDGE_RELEASE).",
+}
+
 TOOLS: List[Dict[str, Any]] = [
     {
         "name": "devin_bridge_status",
-        "description": "Check whether the Devin ACP host and local session DB are reachable.",
+        "description": "Check the Devin ACP host and session DB: devin binary/version, token source, "
+                       "sessions loaded by this bridge, prompts in flight, recent permission answers.",
         "inputSchema": {"type": "object", "properties": {}},
         "annotations": {"readOnlyHint": True},
     },
@@ -1801,7 +2246,9 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "devin_resume_session",
-        "description": "Resume/load a local Devin session through ACP and return config options/status.",
+        "description": "Load a local Devin session into this bridge and return its config options. The "
+                       "bridge then holds the session lock until devin_close_session (or a prompt with "
+                       "release=true). Fails with a clear error if the session is open in Devin Desktop/CLI.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1827,12 +2274,18 @@ TOOLS: List[Dict[str, Any]] = [
                 "prompt": {"type": "string"},
                 "wait": {"type": "boolean", "default": False},
                 "timeout_seconds": {"type": "number", "default": 180},
+                "permission": PERMISSION_SCHEMA,
+                "release": RELEASE_SCHEMA,
+                "attach_bridge": {"type": "boolean", "default": True, "description": "Give the new session the devin-bridge MCP server too"},
             },
         },
     },
     {
         "name": "devin_send_message",
-        "description": "Send a normal text prompt/message to another local Devin session and optionally wait for its response.",
+        "description": "Send a text prompt to a local Devin session. With wait=true (default) it returns "
+                       "status=done with response_text, tool_calls and stop_reason; if the turn outlasts "
+                       "timeout_seconds it returns status=running with partial_text and a request_id for "
+                       "devin_wait_request. Sessions open in Devin Desktop/CLI cannot be joined (session_locked).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1842,6 +2295,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "cwd": {"type": "string", "description": "Workspace override for resuming"},
                 "wait": {"type": "boolean", "default": True},
                 "timeout_seconds": {"type": "number", "default": 180},
+                "permission": PERMISSION_SCHEMA,
+                "release": RELEASE_SCHEMA,
             },
             "required": ["session_id", "message"],
         },
@@ -1866,7 +2321,8 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "devin_stop_session",
-        "description": "Cancel/stop the active turn in a Devin session using ACP session/cancel.",
+        "description": "Cancel the turn this bridge is running in a session (ACP session/cancel) and wait for "
+                       "it to end. It cannot stop a turn driven by Devin Desktop or another CLI process.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1889,13 +2345,16 @@ TOOLS: List[Dict[str, Any]] = [
                 "wait": {"type": "boolean", "default": False},
                 "timeout_seconds": {"type": "number", "default": 180},
                 "cwd": {"type": "string"},
+                "permission": PERMISSION_SCHEMA,
+                "release": RELEASE_SCHEMA,
             },
             "required": ["session_id", "instruction"],
         },
     },
     {
         "name": "devin_wait_request",
-        "description": "Wait for a prompt request_id returned by devin_send_message with wait=false.",
+        "description": "Keep waiting on a prompt request_id (from wait=false, or a status=running result). "
+                       "Returns the full response_text of the turn, or status=running again on timeout.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1996,7 +2455,7 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "session_id": {"type": "string"},
                 "queue_id": {"type": "string"},
-                "status": {"type": "string", "enum": ["queued", "sending", "done", "failed", "cancelled"]},
+                "status": {"type": "string", "enum": ["queued", "sending", "running", "done", "failed", "cancelled"]},
                 "limit": {"type": "integer", "default": 100},
             },
         },
@@ -2027,11 +2486,13 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "devin_close_session",
-        "description": "Close/detach a resumed ACP session. Fails while busy unless stop_first is used.",
+        "description": "Close a session this bridge loaded, releasing its lock so Devin Desktop/CLI can "
+                       "open it. Use stop_first if a turn is still running.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session_id": {"type": "string"},
+                "force": {"type": "boolean", "default": True, "description": "Forced close unloads the session and releases the lock (a plain close keeps it locked in this process); it also ends leftover background shells"},
                 "stop_first": {"type": "boolean", "default": False},
                 "wait_seconds": {"type": "number", "default": 10},
             },
