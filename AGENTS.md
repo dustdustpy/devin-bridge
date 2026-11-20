@@ -8,7 +8,9 @@ If the `devin-bridge` MCP server is available, use it to coordinate other local 
 - Before steering an existing session, check `devin_session_status` or `devin_list_sessions`.
 - To change direction safely, use `devin_redirect_session`; it cancels the active turn before sending the new instruction.
 - For long-running work, use `devin_send_message` with `wait=false`, keep `request_id`, then use `devin_wait_request` or `devin_stop_session`. A `status: running` result (the turn outlasted `timeout_seconds`) works the same way: keep its `request_id` and call `devin_wait_request`.
-- A session open in Devin Desktop or a CLI window is locked to that process. Sending to it fails with `SessionLockedError`. Do not retry in a loop: queue the prompt, or ask the user to close the session there.
+- A session open in Devin Desktop or a CLI window is locked to that process. Sending to it fails with `SessionLockedError`. Do not retry in a loop: ask the user to close the session there and send with `wait_until_free_seconds` (the prompt goes out once the tab is closed), or queue the prompt.
+- Reading never needs the lock: `devin_dump_session` reads the session DB, so you can follow a session the user is driving in Desktop.
+- On a shared ACP host (`devin_bridge_status` shows `shared_host: true`) nothing is locked and the user sees your prompts live in Desktop. Permission questions are deferred there: if a result shows `pending_permissions`, the user can answer in Desktop, or you answer with `devin_answer_permission` after asking the user.
 - After a finished prompt the bridge force-closes the session (`release`, default on) so the user can open it in Desktop. That also ends background shells the turn left running; pass `release: false` when the session must keep them.
 - Permission prompts from the target session are answered by `permission` (`reject` by default, or `allow_once`, `allow_always`, `cancel`). Check `agent_requests` in the result to see what was refused.
 - `cwd` is the filesystem working directory. Sidebar folders/groups are UI-side grouping; `sidebar_folder` is only best-effort metadata and is not guaranteed to move a session in the UI.

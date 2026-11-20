@@ -8,6 +8,31 @@
 - Everything that changes state goes through ACP. On Linux the bridge attaches to the persistent ACP host when an `acp-host-*.lock` file exists. Otherwise, and always on Windows, it spawns its own `devin acp` child and loads sessions into it.
 - Local sessions run in-process, so **one process holds a session at a time**. The bridge cannot load a session that is open in Devin Desktop or a CLI window. It returns a `SessionLockedError` that says what to do instead.
 - After a prompt finishes, the bridge force-closes the session so Desktop/CLI can open it again. This is `release`, on by default.
+- **Shared ACP host** (the best mode): when Devin Desktop connects to a Linux machine over SSH or WSL, it runs `agent acp-host` there, and the bridge on that machine attaches to the same host over TCP. Desktop and the bridge are then two clients of one session: no locks, and prompts sent by the bridge show up live in Desktop. In this mode the bridge never force-closes sessions, and it leaves permission questions for the user to answer in Desktop (`defer`) unless the call sets `permission`.
+
+To drive a remote machine's sessions from Windows, run the bridge there over SSH (key auth, no prompts):
+
+```bash
+claude mcp add devin-bridge-vm --scope user -- ssh -T -o BatchMode=yes user@host env PYTHONUNBUFFERED=1 python3 /home/user/devin-bridge/devin_bridge_mcp.py
+```
+
+## devin-cloud (Devin Cloud sessions)
+
+`devin_cloud_mcp.py` is a second, standalone MCP server for **Devin Cloud** sessions through the Devin REST API v3 (`https://api.devin.ai/v3/organizations/{org_id}/sessions…`). It uses personal access tokens (`cog_…`) and the Python standard library only.
+
+Accounts live outside the repo in `~/.devin-bridge/cloud_accounts.json` (or `$DEVIN_CLOUD_CONFIG`). Lock the file down to your user:
+
+```json
+{"accounts": [{"name": "cloud", "org_id": "org-…", "token": "cog_…"}]}
+```
+
+A PAT is not bound to one org by the API. `devin_cloud_accounts` shows which org each token's sessions live in (`token_org_id`) and warns when the configured `org_id` differs; a mismatch gives `403 Missing required permission '_org.is_user'`.
+
+Tools: `devin_cloud_accounts`, `devin_cloud_list_sessions`, `devin_cloud_get_session`, `devin_cloud_messages`, `devin_cloud_send_message` (optional `wait_seconds` polls until Devin stops working and returns its new messages), `devin_cloud_wait`, `devin_cloud_create_session`, `devin_cloud_archive_session`, `devin_cloud_terminate_session` (needs `confirm=true`). Session tools accept a session id, an `app.devin.ai/sessions/…` URL or an exact title (`codex1`), and search every configured org when no account is given.
+
+```bash
+claude mcp add devin-cloud --scope user --env PYTHONIOENCODING=utf-8 -- python /path/to/devin_cloud_mcp.py
+```
 
 ## Paths
 
@@ -62,7 +87,7 @@ On Windows the bridge needs the `cryptography` package. It reads Devin Desktop's
 - `devin_list_sessions`: lists local sessions. Each one is marked `held_by_this_bridge` or `open_elsewhere`.
 - `devin_session_status`: inspects one session.
 - `devin_new_session`: creates a session with `cwd`, plus optional `model`, `mode`, `prompt`, `permission` and `release`.
-- `devin_send_message`: sends a prompt. With `wait=true` you get `status: done` with `response_text`, `tool_calls`, `stop_reason` and `agent_requests`. If the turn outlasts the timeout you get `status: running` with `partial_text` and a `request_id`.
+- `devin_send_message`: sends a prompt. With `wait=true` you get `status: done` with `response_text`, `tool_calls`, `stop_reason` and `agent_requests`. If the turn outlasts the timeout you get `status: running` with `partial_text` and a `request_id`. With `wait_until_free_seconds`, a session that is open in Devin Desktop/CLI is polled every 3 s and the prompt goes out as soon as it is closed there.
 - `devin_wait_request`: keeps waiting on a `request_id` and returns the whole turn's text.
 - `devin_stop_session`: cancels a turn this bridge started.
 - `devin_redirect_session`: stops the session, then sends a new instruction.
@@ -71,6 +96,7 @@ On Windows the bridge needs the `cryptography` package. It reads Devin Desktop's
 - `devin_dump_session`: writes the transcript to Markdown. It covers the main chain since the last context compaction.
 - `devin_queue_prompt`, `devin_queue_status`, `devin_process_queue`, `devin_queue_cancel`: the persistent prompt queue. A job whose session is locked elsewhere goes back to `queued`.
 - `devin_send_slash_command`, `devin_list_slash_commands`: the slash-command front end.
+- `devin_answer_permission`: answers a permission question the session is waiting on (listed as `pending_permissions` in results and status).
 - `devin_delete_session`: deletes a session. This is destructive.
 
 ## Behavior notes
@@ -80,7 +106,9 @@ On Windows the bridge needs the `cryptography` package. It reads Devin Desktop's
 - Releasing a session is a forced `session/close`, because a plain close keeps it loaded and locked in this process. The forced close also ends any background shells the turn left running. Pass `release: false` to keep them.
 - `devin_stop_session` only reaches turns this bridge started. Turns that Desktop or a CLI window drives have to be stopped there.
 - On Windows the spawned `devin acp` sits in a job object, so it dies with the bridge. An orphaned `devin acp` would otherwise keep every session it loaded locked.
-- Daemon process model: since 3000.13.4, Devin can run sessions in a shared background daemon, where several clients join one session. `DEVIN_BRIDGE_PROCESS_MODEL=daemon` makes the bridge use it. Desktop sessions only become joinable if Desktop runs in daemon mode too (`process_model` in Devin's `config.json`). If the daemon refuses to start with "exited before it listened at …\daemon\daemon.sock", a stale `daemon.sock` from an earlier crash is the likely cause.
+- Daemon process model: since 3000.13.4, Devin can run sessions in a shared background daemon, where several clients join one session. `DEVIN_BRIDGE_PROCESS_MODEL=daemon` makes the bridge use it. Desktop sessions only become joinable if Desktop runs in daemon mode too (`process_model` in Devin's `config.json`).
+- On Windows with Devin 3000.14.30825 the daemon does not work: it logs "listening", but `devin acp` and `devin daemon status` never connect to it ("did not listen … within 120 s"). Do not set `process_model: daemon` there, or Desktop cannot open sessions at all. A leftover `daemon.sock` (an AF_UNIX reparse point) cannot be deleted (WinError 1920); rename the `cli\daemon` folder instead.
+- Until then, the user and the bridge take turns on a session: read it any time with `devin_dump_session`, and send with `wait_until_free_seconds` while the user closes its Desktop tab.
 
 ## Slash-like commands
 

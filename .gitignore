@@ -1,3 +1,7 @@
 __pycache__/
 *.py[cod]
 .devin_bridge_queue.lock
+
+# Devin Cloud tokens live outside the repo (~/.devin-bridge/cloud_accounts.json); never commit one
+cloud_accounts.json
+*.token

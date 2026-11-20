@@ -61,7 +61,7 @@ QUEUE_PATH = DATA_DIR / "devin_bridge_queue.json"
 QUEUE_LOCK_PATH = DATA_DIR / "devin_bridge_queue.lock"
 SCRIPT_PATH = Path(__file__).resolve()
 SERVER_NAME = "devin-bridge"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
 LOCK_PATTERNS = (
@@ -77,7 +77,9 @@ DEFAULT_PROMPT_TIMEOUT = float(os.environ.get("DEVIN_BRIDGE_PROMPT_TIMEOUT", "18
 # `--process-model` passed to the spawned `devin acp` (daemon | in-process). Empty = Devin's default.
 PROCESS_MODEL = os.environ.get("DEVIN_BRIDGE_PROCESS_MODEL", "").strip()
 # How the bridge answers the agent's session/request_permission when the caller set no policy.
-PERMISSION_POLICIES = ("reject", "allow_once", "allow_always", "cancel")
+# "defer" leaves the question for someone else to answer: Devin Desktop on a shared host, or
+# devin_answer_permission. It is the default when the bridge is attached to a shared ACP host.
+PERMISSION_POLICIES = ("reject", "allow_once", "allow_always", "cancel", "defer")
 DEFAULT_PERMISSION_POLICY = os.environ.get("DEVIN_BRIDGE_PERMISSION", "reject").strip().lower()
 if DEFAULT_PERMISSION_POLICY not in PERMISSION_POLICIES:
     DEFAULT_PERMISSION_POLICY = "reject"
@@ -663,36 +665,37 @@ def _desktop_secret_db() -> Optional[Path]:
     return None
 
 
-def _load_api_token() -> Optional[str]:
-    """Resolve a Devin session token for spawned `devin acp` children.
+_TOKEN_ACCOUNT: Optional[str] = None
+_TOKEN_KIND: Optional[str] = None
+CURRENT_AUTH_EXTENSION = "codeium.windsurf-auth"  # the legacy "codeium.windsurf" store keeps old sign-ins
 
-    Order: explicit env vars, then (Windows only) the Devin Desktop secret
-    store, which holds Electron safeStorage values that are AES-GCM encrypted
-    with the DPAPI-protected os_crypt key from "Local State". This only works
-    for the same Windows user that owns the Desktop profile.
-    """
-    global _TOKEN_CACHE, _TOKEN_RESOLVED, _TOKEN_ERROR
-    if _TOKEN_RESOLVED:
-        return _TOKEN_CACHE
-    _TOKEN_RESOLVED = True
-    for var in ("DEVIN_BRIDGE_API_KEY", "DEVIN_API_KEY", "WINDSURF_API_KEY", "CODEIUM_API_KEY"):
-        value = os.environ.get(var)
-        if value:
-            _TOKEN_CACHE = value.strip()
-            return _TOKEN_CACHE
-    if not IS_WINDOWS:
-        _TOKEN_ERROR = "no DEVIN_BRIDGE_API_KEY/WINDSURF_API_KEY set (Desktop secret store is Windows-only)"
-        return None
+
+def _desktop_active_api_key(db: Path) -> Optional[str]:
+    """Key of the account Devin Desktop is signed in to right now (`windsurfAuthStatus.apiKey`)."""
     try:
-        import base64
-        import ctypes
-        import ctypes.wintypes
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        try:
+            row = con.execute("SELECT value FROM ItemTable WHERE key='windsurfAuthStatus'").fetchone()
+        finally:
+            con.close()
+        status = json.loads(row[0]) if row else {}
+        return (status.get("apiKey") if isinstance(status, dict) else None) or None
+    except Exception:
+        return None
 
-        db = _desktop_secret_db()
-        if not db:
-            _TOKEN_ERROR = "Devin Desktop secret store (User/globalStorage/state.vscdb) not found"
-            return None
+
+def _desktop_secret_sessions(db: Path) -> List[Tuple[str, str, str]]:
+    """(extension id, account label, accessToken) for every sign-in in the Desktop secret store.
+
+    The store holds Electron safeStorage values, AES-GCM encrypted with the DPAPI-protected
+    os_crypt key from "Local State", so this only works for the Windows user owning the profile.
+    """
+    import base64
+    import ctypes
+    import ctypes.wintypes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if True:  # keep the original block structure below
 
         class DATA_BLOB(ctypes.Structure):
             _fields_ = [
@@ -720,8 +723,7 @@ def _load_api_token() -> Optional[str]:
         enc_key = base64.b64decode(ls["os_crypt"]["encrypted_key"])
         key = unprotect(enc_key[5:])
         if not key:
-            _TOKEN_ERROR = "DPAPI could not unprotect Devin Desktop's os_crypt key (different Windows user?)"
-            return None
+            raise BridgeError("DPAPI could not unprotect Devin Desktop's os_crypt key (different Windows user?)")
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
         try:
             rows = con.execute(
@@ -729,9 +731,14 @@ def _load_api_token() -> Optional[str]:
             ).fetchall()
         finally:
             con.close()
+        found: List[Tuple[str, str, str]] = []
         for skey, val in rows:
             if "sessions" not in str(skey):
                 continue
+            try:
+                ext = json.loads(str(skey)[len("secret://"):]).get("extensionId", "")
+            except Exception:
+                ext = ""
             if isinstance(val, bytes):
                 val = val.decode("utf-8", "replace")
             try:
@@ -748,15 +755,52 @@ def _load_api_token() -> Optional[str]:
                 for sess in sessions:
                     token = (sess or {}).get("accessToken")
                     if token:
-                        _TOKEN_CACHE = token
-                        return _TOKEN_CACHE
+                        found.append((ext, str(((sess or {}).get("account") or {}).get("label") or ""), token))
+        return found
+
+
+def _load_api_token() -> Optional[str]:
+    """Resolve the Devin token for spawned `devin acp` children.
+
+    Order: explicit env vars; then (Windows) the account Devin Desktop is signed in to right now
+    (`windsurfAuthStatus.apiKey`); then the Desktop secret store, preferring the current auth
+    extension over the legacy one. The legacy store keeps sessions of accounts that have signed
+    out, and their tokens can still be valid, so picking "the first token found" can silently run
+    sessions (and spend quota) on the wrong account.
+    """
+    global _TOKEN_CACHE, _TOKEN_RESOLVED, _TOKEN_ERROR, _TOKEN_ACCOUNT, _TOKEN_KIND
+    if _TOKEN_RESOLVED:
+        return _TOKEN_CACHE
+    _TOKEN_RESOLVED = True
+    for var in ("DEVIN_BRIDGE_API_KEY", "DEVIN_API_KEY", "WINDSURF_API_KEY", "CODEIUM_API_KEY"):
+        value = os.environ.get(var)
+        if value:
+            _TOKEN_CACHE, _TOKEN_KIND = value.strip(), f"env:{var}"
+            return _TOKEN_CACHE
+    if not IS_WINDOWS:
+        _TOKEN_ERROR = "no DEVIN_BRIDGE_API_KEY/WINDSURF_API_KEY set (Desktop secret store is Windows-only)"
+        return None
+    db = _desktop_secret_db()
+    if not db:
+        _TOKEN_ERROR = "Devin Desktop state DB (User/globalStorage/state.vscdb) not found"
+        return None
+    active = _desktop_active_api_key(db)
+    sessions: List[Tuple[str, str, str]] = []
+    try:
+        sessions = _desktop_secret_sessions(db)
     except ImportError as e:
         _TOKEN_ERROR = f"missing Python package for the Desktop token: {e.name} (pip install cryptography)"
-        return None
     except Exception as e:
         _TOKEN_ERROR = f"{type(e).__name__}: {e}"
-        return None
-    _TOKEN_ERROR = "no Devin session accessToken found in the Desktop secret store (sign in to Devin Desktop)"
+    if active:
+        _TOKEN_CACHE, _TOKEN_KIND = active, "desktop-active-login"
+        _TOKEN_ACCOUNT = next((label for _, label, tok in sessions if tok == active), None)
+        return _TOKEN_CACHE
+    if sessions:
+        ext, label, tok = sorted(sessions, key=lambda s: 0 if s[0] == CURRENT_AUTH_EXTENSION else 1)[0]
+        _TOKEN_CACHE, _TOKEN_KIND, _TOKEN_ACCOUNT = tok, f"desktop-secret:{ext}", label or None
+        return _TOKEN_CACHE
+    _TOKEN_ERROR = _TOKEN_ERROR or "no signed-in Devin Desktop account found (sign in to Devin Desktop)"
     return None
 
 
@@ -764,7 +808,7 @@ def _token_source() -> str:
     for var in ("DEVIN_BRIDGE_API_KEY", "DEVIN_API_KEY", "WINDSURF_API_KEY", "CODEIUM_API_KEY"):
         if os.environ.get(var):
             return f"env:{var}"
-    return "desktop-secret" if _load_api_token() else "none"
+    return (_TOKEN_KIND or "desktop") if _load_api_token() else "none"
 
 
 def _kill_on_close_job(proc: subprocess.Popen) -> Any:
@@ -847,6 +891,19 @@ def _close_job(job: Any) -> None:
         pass
 
 
+def _pick_option(options: List[Dict[str, Any]], policy: str) -> Optional[Dict[str, Any]]:
+    prefer = {
+        "allow_once": ("allow_once", "allow_always"),
+        "allow_always": ("allow_always", "allow_once"),
+        "reject": ("reject_once", "reject_always"),
+    }.get(policy, ())
+    return next((o for kind in prefer for o in options if o.get("kind") == kind), None)
+
+
+def _outcome(pick: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"outcome": "selected", "optionId": pick.get("optionId")} if pick else {"outcome": "cancelled"}
+
+
 class AcpClient:
     def __init__(self) -> None:
         self.sock: Optional[socket.socket] = None
@@ -871,6 +928,19 @@ class AcpClient:
         self.session_updates: Dict[str, Deque[Dict[str, Any]]] = {}
         self.permission_policy: Dict[str, str] = {}
         self.agent_requests: Deque[Dict[str, Any]] = deque(maxlen=200)
+        self.pending_permissions: Dict[str, List[Dict[str, Any]]] = {}
+
+    @property
+    def shared_host(self) -> bool:
+        """Attached to a persistent ACP host (e.g. the one Devin Desktop starts over SSH)."""
+        return self.transport == "tcp"
+
+    def effective_policy(self, session_id: Optional[str]) -> str:
+        explicit = self.permission_policy.get(session_id or "")
+        if explicit:
+            return explicit
+        # On a shared host the user may be watching in Devin Desktop: never answer for them.
+        return "defer" if self.shared_host else DEFAULT_PERMISSION_POLICY
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -904,6 +974,7 @@ class AcpClient:
         self.resumed.clear()
         self.pending.clear()
         self.completed.clear()
+        self.pending_permissions.clear()
         while True:
             try:
                 self._rx.get_nowait()
@@ -1116,27 +1187,20 @@ class AcpClient:
         sid = params.get("sessionId")
         record: Dict[str, Any] = {"at": _utc_ts(), "method": method, "session_id": sid}
         if method == "session/request_permission":
-            policy = self.permission_policy.get(sid or "", DEFAULT_PERMISSION_POLICY)
+            policy = self.effective_policy(sid)
             options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
-            prefer = {
-                "allow_once": ("allow_once", "allow_always"),
-                "allow_always": ("allow_always", "allow_once"),
-                "reject": ("reject_once", "reject_always"),
-            }.get(policy, ())
-            pick = next((o for kind in prefer for o in options if o.get("kind") == kind), None)
-            outcome = (
-                {"outcome": "selected", "optionId": pick.get("optionId")}
-                if pick
-                else {"outcome": "cancelled"}
-            )
-            response: Dict[str, Any] = {"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": outcome}}
-            record.update(
-                {
-                    "tool": (params.get("toolCall") or {}).get("title"),
-                    "policy": policy,
-                    "answer": pick.get("kind") if pick else "cancelled",
-                }
-            )
+            tool = (params.get("toolCall") or {}).get("title")
+            if policy == "defer":
+                self.pending_permissions.setdefault(sid or "", []).append(
+                    {"id": msg["id"], "tool": tool, "options": options, "at": _utc_ts()}
+                )
+                record.update({"tool": tool, "policy": policy, "answer": "deferred"})
+                self.agent_requests.append(record)
+                self._record_update({"method": "_bridge/agent_request", "params": dict(record, sessionId=sid)})
+                return
+            pick = _pick_option(options, policy)
+            response: Dict[str, Any] = {"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": _outcome(pick)}}
+            record.update({"tool": tool, "policy": policy, "answer": pick.get("kind") if pick else "cancelled"})
         else:
             response = {
                 "jsonrpc": "2.0",
@@ -1474,6 +1538,10 @@ def _release(session_id: str) -> Any:
     """
     if session_id not in ACP.resumed:
         return False
+    if ACP.shared_host:
+        # Nothing to unlock on a shared host, and a forced close would pull the session out
+        # from under Devin Desktop while the user is watching it.
+        return "not needed (shared ACP host)"
     try:
         ACP.call("session/close", {"sessionId": session_id, "_meta": FORCE_CLOSE_META}, timeout=30)
     except Exception as e:  # unsupported or refused: keep it loaded
@@ -1500,7 +1568,13 @@ def _finish_prompt(req_id: int, timeout: float, base: Dict[str, Any]) -> Dict[st
                         "waiting, or devin_stop_session to cancel it.",
             }
         )
+        waiting = _pending_permission_view(sid)
+        if waiting:
+            base["pending_permissions"] = waiting
+            base["hint"] = ("Devin is waiting for a permission answer. Answer it in Devin Desktop or with "
+                            "devin_answer_permission, then call devin_wait_request.")
         return base
+    ACP.pending_permissions.pop(sid or "", None)  # the turn is over; leftover questions are moot
     summary = _turn_summary(sid, start) if sid else {}
     base.update(
         {
@@ -1521,6 +1595,36 @@ def _finish_prompt(req_id: int, timeout: float, base: Dict[str, Any]) -> Dict[st
     return base
 
 
+def _pending_permission_view(session_id: Optional[str]) -> List[Dict[str, Any]]:
+    return [
+        {"index": i, "tool": r.get("tool"), "options": [o.get("kind") for o in r.get("options", [])], "at": r.get("at")}
+        for i, r in enumerate(ACP.pending_permissions.get(session_id or "", []))
+    ]
+
+
+def _open_elsewhere(session_id: str) -> Optional[bool]:
+    """True when another Devin process (Desktop, a CLI window, another bridge) holds the session."""
+    if session_id in ACP.resumed:
+        return False
+    sess = _session_from_acp(session_id)
+    if ACP.shared_host:
+        return False  # on a shared host every client joins the same session; nothing is locked
+    if not sess:
+        return None
+    return bool((sess.get("_meta") or {}).get("cognition.ai/isLocked"))
+
+
+def _wait_until_free(session_id: str, seconds: float, poll: float = 3.0) -> Dict[str, Any]:
+    """Block until the session is no longer held by another process (e.g. its Desktop tab closed)."""
+    started = time.monotonic()
+    while True:
+        if not _open_elsewhere(session_id):
+            return {"free": True, "waited_seconds": round(time.monotonic() - started, 1)}
+        if time.monotonic() - started >= seconds:
+            return {"free": False, "waited_seconds": round(time.monotonic() - started, 1)}
+        time.sleep(poll)
+
+
 def _send_prompt(
     session_id: str,
     text: str,
@@ -1529,6 +1633,7 @@ def _send_prompt(
     cwd: Optional[str] = None,
     permission: Any = None,
     release: Optional[bool] = None,
+    wait_until_free: float = 0,
 ) -> Dict[str, Any]:
     if not text:
         raise BridgeError("message/prompt text is required")
@@ -1540,6 +1645,14 @@ def _send_prompt(
             "Use devin_wait_request, devin_stop_session or devin_redirect_session first."
         )
     policy = _normalize_policy(permission)
+    waited: Optional[Dict[str, Any]] = None
+    if wait_until_free and wait_until_free > 0:
+        waited = _wait_until_free(sid, min(float(wait_until_free), 3600.0))
+        if not waited["free"]:
+            raise SessionLockedError(
+                f"Session '{sid}' was still open in another Devin process after "
+                f"{waited['waited_seconds']}s. Close its tab in Devin Desktop (or the CLI window) and retry."
+            )
     _resume(sid, cwd=cwd)
     if policy:
         ACP.permission_policy[sid] = policy
@@ -1554,8 +1667,10 @@ def _send_prompt(
         "request_id": req_id,
         "sent": True,
         "wait": bool(wait),
-        "permission_policy": ACP.permission_policy.get(sid, DEFAULT_PERMISSION_POLICY),
+        "permission_policy": ACP.effective_policy(sid),
     }
+    if waited:
+        base["waited_for_free_seconds"] = waited["waited_seconds"]
     if not wait:
         base["status"] = "running"
         return base
@@ -1582,9 +1697,10 @@ def tool_bridge_status(args: Dict[str, Any]) -> Dict[str, Any]:
         "db_path": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
         "token_source": _token_source(),
+        "token_account": _TOKEN_ACCOUNT,
         "transport": ACP.transport,
         "process_model": PROCESS_MODEL or "devin default",
-        "default_permission_policy": DEFAULT_PERMISSION_POLICY,
+        "default_permission_policy": DEFAULT_PERMISSION_POLICY + " (defer when attached to a shared ACP host)",
         "release_after_prompt": RELEASE_AFTER_PROMPT,
         "client_capabilities": CLIENT_CAPABILITIES,
     }
@@ -1606,7 +1722,14 @@ def tool_bridge_status(args: Dict[str, Any]) -> Dict[str, Any]:
         ACP._connect()
         out["acp_initialized"] = ACP.initialized
         out["acp_transport"] = ACP.transport
+        out["shared_host"] = ACP.shared_host
         out["acp_pid"] = ACP.proc.pid if ACP.proc else None
+        if ACP.lock_path:
+            out["acp_lock"] = str(ACP.lock_path)
+            out["acp_host_pid"] = ACP.lock_data.get("pid")
+        waiting = {sid: _pending_permission_view(sid) for sid in ACP.pending_permissions if ACP.pending_permissions[sid]}
+        if waiting:
+            out["pending_permissions"] = waiting
         out["kill_on_exit_job"] = bool(ACP.job)
         out["loaded_sessions"] = sorted(ACP.resumed)
         out["prompts_in_flight"] = {
@@ -1673,6 +1796,9 @@ def tool_session_status(args: Dict[str, Any]) -> Dict[str, Any]:
     busy = ACP.pending_prompts(sid)
     if busy:
         out["prompts_in_flight"] = busy
+    waiting = _pending_permission_view(sid)
+    if waiting:
+        out["pending_permissions"] = waiting
     if args.get("include_config"):
         resumed = _resume(sid, cwd=args.get("cwd"))
         out["configOptions"] = resumed.get("configOptions", [])
@@ -1762,6 +1888,7 @@ def tool_send_message(args: Dict[str, Any]) -> Dict[str, Any]:
         cwd=args.get("cwd"),
         permission=args.get("permission"),
         release=args.get("release"),
+        wait_until_free=float(args.get("wait_until_free_seconds") or 0),
     )
 
 
@@ -2187,6 +2314,36 @@ def tool_process_queue(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"processed": processed, "processed_count": len(processed), "queued_remaining": remaining}
 
 
+def tool_answer_permission(args: Dict[str, Any]) -> Dict[str, Any]:
+    sid = _acp_session_id(str(args.get("session_id") or ""))
+    waiting = ACP.pending_permissions.get(sid) or []
+    if not waiting:
+        raise BridgeError(
+            f"no permission question is waiting in session {sid} (it was answered in Devin Desktop, "
+            "or the turn already ended)"
+        )
+    index = int(args.get("index") or 0)
+    if not 0 <= index < len(waiting):
+        raise BridgeError(f"index must be between 0 and {len(waiting) - 1}")
+    choice = str(args.get("choice") or "").strip()
+    req = waiting[index]
+    pick = next((o for o in req["options"] if o.get("optionId") == choice), None)
+    if pick is None:
+        policy = _normalize_policy(choice)
+        if policy in (None, "defer"):
+            raise BridgeError("choice must be allow_once, allow_always, reject, cancel or an optionId")
+        pick = _pick_option(req["options"], policy)
+    with ACP.lock:
+        ACP._write_raw({"jsonrpc": "2.0", "id": req["id"], "result": {"outcome": _outcome(pick)}})
+    waiting.pop(index)
+    return {
+        "session_id": sid,
+        "tool": req.get("tool"),
+        "answered": pick.get("kind") if pick else "cancelled",
+        "still_waiting": _pending_permission_view(sid),
+    }
+
+
 def tool_queue_cancel(args: Dict[str, Any]) -> Dict[str, Any]:
     queue_id = str(args.get("queue_id") or "")
     if not queue_id:
@@ -2200,8 +2357,9 @@ def tool_queue_cancel(args: Dict[str, Any]) -> Dict[str, Any]:
 PERMISSION_SCHEMA: Dict[str, Any] = {
     "type": "string",
     "enum": list(PERMISSION_POLICIES),
-    "description": "How the bridge answers Devin's permission prompts in this session "
-                   "(default: DEVIN_BRIDGE_PERMISSION, normally reject). Sessions in bypass mode never ask.",
+    "description": "How the bridge answers Devin's permission prompts in this session. Default: defer "
+                   "on a shared ACP host (you answer in Devin Desktop, or via devin_answer_permission), "
+                   "otherwise DEVIN_BRIDGE_PERMISSION (reject). Sessions in bypass mode never ask.",
 }
 RELEASE_SCHEMA: Dict[str, Any] = {
     "type": "boolean",
@@ -2297,6 +2455,13 @@ TOOLS: List[Dict[str, Any]] = [
                 "timeout_seconds": {"type": "number", "default": 180},
                 "permission": PERMISSION_SCHEMA,
                 "release": RELEASE_SCHEMA,
+                "wait_until_free_seconds": {
+                    "type": "number",
+                    "default": 0,
+                    "maximum": 3600,
+                    "description": "If the session is open in Devin Desktop/CLI, wait up to this long for "
+                                   "it to be closed there, then send (polls every 3 s)",
+                },
             },
             "required": ["session_id", "message"],
         },
@@ -2485,6 +2650,20 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "devin_answer_permission",
+        "description": "Answer a permission question Devin is waiting on in a session (questions are "
+                       "deferred by default on a shared ACP host). Ask the user before allowing anything.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "choice": {"type": "string", "description": "allow_once, allow_always, reject, cancel, or an exact optionId"},
+                "index": {"type": "integer", "default": 0, "description": "Which waiting question (see pending_permissions)"},
+            },
+            "required": ["session_id", "choice"],
+        },
+    },
+    {
         "name": "devin_close_session",
         "description": "Close a session this bridge loaded, releasing its lock so Devin Desktop/CLI can "
                        "open it. Use stop_first if a turn is still running.",
@@ -2534,6 +2713,7 @@ TOOL_FUNCS = {
     "devin_queue_status": tool_queue_status,
     "devin_process_queue": tool_process_queue,
     "devin_queue_cancel": tool_queue_cancel,
+    "devin_answer_permission": tool_answer_permission,
     "devin_close_session": tool_close_session,
     "devin_delete_session": tool_delete_session,
 }
