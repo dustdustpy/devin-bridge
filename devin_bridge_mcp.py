@@ -56,12 +56,13 @@ def _devin_data_dir() -> Path:
 
 DATA_DIR = _devin_data_dir()
 DB_PATH = DATA_DIR / "sessions.db"
+CLI_CREDENTIALS = DATA_DIR.parent / "credentials.toml"  # written by `devin auth login`
 DUMP_DIR = DATA_DIR / "session_dumps"
 QUEUE_PATH = DATA_DIR / "devin_bridge_queue.json"
 QUEUE_LOCK_PATH = DATA_DIR / "devin_bridge_queue.lock"
 SCRIPT_PATH = Path(__file__).resolve()
 SERVER_NAME = "devin-bridge"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.4.1"
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
 LOCK_PATTERNS = (
@@ -625,6 +626,12 @@ def _find_devin_command() -> str:
         standalone = Path(localapp) / "devin/cli/bin/devin.exe"
         if standalone.is_file():
             return str(standalone)
+    else:
+        # The installer links the CLI into ~/.local/bin, which is not on PATH in the
+        # non-interactive SSH shell a remote bridge is usually launched from.
+        standalone = HOME / ".local/bin/devin"
+        if standalone.is_file() and os.access(str(standalone), os.X_OK):
+            return str(standalone)
     raise BridgeError(
         "devin CLI binary not found; set DEVIN_ACP_COMMAND to the devin executable path"
     )
@@ -778,7 +785,7 @@ def _load_api_token() -> Optional[str]:
             _TOKEN_CACHE, _TOKEN_KIND = value.strip(), f"env:{var}"
             return _TOKEN_CACHE
     if not IS_WINDOWS:
-        _TOKEN_ERROR = "no DEVIN_BRIDGE_API_KEY/WINDSURF_API_KEY set (Desktop secret store is Windows-only)"
+        _TOKEN_ERROR = "no DEVIN_BRIDGE_API_KEY/WINDSURF_API_KEY set and the devin CLI is not logged in here (run `devin auth login`)"
         return None
     db = _desktop_secret_db()
     if not db:
@@ -804,11 +811,35 @@ def _load_api_token() -> Optional[str]:
     return None
 
 
+def _live_acp_host() -> bool:
+    """A Desktop-started `acp-host` whose lock file names a running process."""
+    try:
+        pid = int(_load_lock()[1].get("pid") or 0)
+    except (BridgeError, OSError, ValueError, TypeError):
+        return False
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _token_source() -> str:
+    """Whose credentials (and quota) the prompts sent through this bridge run on."""
+    if not IS_WINDOWS and _live_acp_host():
+        # The host's agent is authenticated by the Devin Desktop that started it.
+        return "acp-host (account of the Devin Desktop that started it)"
     for var in ("DEVIN_BRIDGE_API_KEY", "DEVIN_API_KEY", "WINDSURF_API_KEY", "CODEIUM_API_KEY"):
         if os.environ.get(var):
             return f"env:{var}"
-    return (_TOKEN_KIND or "desktop") if _load_api_token() else "none"
+    if _load_api_token():
+        return _TOKEN_KIND or "desktop"
+    # Nothing to inject: the spawned `devin acp` uses this machine's own `devin auth login`.
+    return "devin-cli-login" if CLI_CREDENTIALS.is_file() else "none"
 
 
 def _kill_on_close_job(proc: subprocess.Popen) -> Any:
@@ -1706,6 +1737,8 @@ def tool_bridge_status(args: Dict[str, Any]) -> Dict[str, Any]:
     }
     if _TOKEN_ERROR and out["token_source"] == "none":
         out["token_error"] = _TOKEN_ERROR
+    if out["token_source"] == "devin-cli-login":
+        out["cli_credentials"] = str(CLI_CREDENTIALS)
     if ACP.lock_path:
         out["acp_lock"] = str(ACP.lock_path)
         out["acp_host_pid"] = ACP.lock_data.get("pid")

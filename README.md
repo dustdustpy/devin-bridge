@@ -42,7 +42,7 @@ claude mcp add devin-cloud --scope user --env PYTHONIOENCODING=utf-8 -- python /
 | Devin MCP config | `~/.config/devin/mcp_config.json` | `%APPDATA%\devin\mcp_config.json` |
 | Prompt queue | `<data dir>/devin_bridge_queue.json` (+ `.lock`) | same |
 | Transcript dumps | `<data dir>/session_dumps/` | same |
-| `devin` binary | `devin` on PATH | Devin Desktop's bundled `devin.exe`, then PATH, then `%LOCALAPPDATA%\devin\cli\bin\devin.exe` |
+| `devin` binary | `devin` on PATH, then `~/.local/bin/devin` | Devin Desktop's bundled `devin.exe`, then PATH, then `%LOCALAPPDATA%\devin\cli\bin\devin.exe` |
 
 On Windows the bridge prefers the binary bundled with Devin Desktop. Desktop hosts your sessions with it, while the standalone CLI on PATH can be several versions behind and still writes to the same `sessions.db`.
 
@@ -69,6 +69,17 @@ claude mcp add devin-bridge --scope user --env PYTHONIOENCODING=utf-8 --env PYTH
 ```
 
 On Windows the bridge needs the `cryptography` package. It reads Devin Desktop's session token from Desktop's encrypted secret store and passes it to the spawned `devin acp`. The store is protected with DPAPI, so this only works for the same Windows user. Alternatively, set `DEVIN_BRIDGE_API_KEY`.
+
+### Which account a prompt runs on
+
+`devin_bridge_status` reports it as `token_source`:
+
+- `desktop-active-login`: Windows, the account Devin Desktop is signed in to.
+- `acp-host (…)`: Linux, attached to a host that Devin Desktop started over SSH. Desktop hands that host its own key over ACP `authenticate`, so prompts run on Desktop's account even if the machine has a CLI login of its own.
+- `devin-cli-login`: nothing to inject, so the spawned `devin acp` uses that machine's `devin auth login`.
+- `env:<VAR>`: a key set in the bridge's environment.
+
+To run a remote machine on a different account than your Desktop, log the CLI in there with that account (`devin auth login`) and drive it only through a bridge on that machine. Opening it from Desktop over SSH would switch its sessions to Desktop's account.
 
 ## Settings (environment)
 
